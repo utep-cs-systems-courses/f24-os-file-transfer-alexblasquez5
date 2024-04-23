@@ -1,96 +1,122 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 
 import socket
-import os
 import sys
+import os
 import struct
 
-def out_band_deframe(files):
-    extracted_files, extracted_contents = [], []
+def frame_data(files):
+    framed_data = b""
+    for file_name in files:
+        if not os.path.exists(file_name):
+            print(f"File {file_name} does not exist", file=sys.stderr)
+            return None
+        
+        with open(file_name, "rb") as f:
+            content = f.read()
+        
+        file_name_encoded = file_name.encode()
+        file_name_length = struct.pack("Q", len(file_name_encoded))
+        content_size = struct.pack("Q", len(content))
 
-    if not os.path.exists(files):                              
-        os.write(2, ("Framed file %s does not exist\n" % files).encode())
-        exit()
+        framed_data += file_name_length + file_name_encoded + content_size + content
+    
+    return framed_data
 
-    with open(files, 'rb') as file:
-        while True:
-            raw_length = file.read(8)
-            if not raw_length:
-                break 
-            filename_length = struct.unpack("Q", raw_length)[0]
+def send_framed_data(connection, files):
+    framed_data = frame_data(files)
+    if framed_data:
+        connection.sendall(framed_data)
+        connection.sendall(b'EOF')
 
-            filename = file.read(filename_length).decode()
-            content_size = struct.unpack("Q", file.read(8))[0]
-
-            content = file.read(content_size)
-
-            with open(filename, 'wb') as f:
-                f.write(content)
-                extracted_files.append(filename)
-                extracted_contents.append(content)
-
-    return extracted_files, extracted_contents
-
-def receiver(connection):
-    folder = "transferred-files"
-    os.makedirs(folder, exist_ok=True)
-    filename = connection.recv(1024).decode()
-    file_path = os.path.join(folder, filename)
-
-    if os.path.isfile(file_path):
-        os.remove(file_path)
-
-    with open(file_path, 'wb') as file:
-        while True:
-            data = connection.recv(1024)
-            if not data:
-                break
-            file.write(data)
-
-    extracted_files, extracted_contents = out_band_deframe(file_path)
-    os.remove(file_path)
-
-    return extracted_files, extracted_contents
-
-def ack(connection, ack_message):
-    ack_message = ack_message.encode()
-    connection.sendall(ack_message)
-
-def reap_zombies():
+def receive_framed_data(connection):
+    framed_data = b""
     while True:
-        try:
-            pid, status = os.waitpid(-1, os.WNOHANG)
-            if pid == 0:
-                break
-            print(f"Child process {pid} terminated")
-        except OSError:
+        data = connection.recv(1024)
+        if not data:
+            break
+        framed_data += data
+        if b'EOF' in data:
+            break
+    return framed_data
+
+def extract_data(framed_data):
+    extracted_files = []
+    extracted_contents = []
+
+    while len(framed_data) >= 8:
+        file_name_length = struct.unpack("Q", framed_data[:8])[0]
+        if len(framed_data) < 8 + file_name_length + 8:
             break
 
+        file_name = framed_data[8:8 + file_name_length].decode()
+        content_size = struct.unpack("Q", framed_data[8 + file_name_length:8 + file_name_length + 8])[0]
+        if len(framed_data) < 8 + file_name_length + 8 + content_size:
+            break
+
+        content = framed_data[8 + file_name_length + 8:8 + file_name_length + 8 + content_size]
+
+        extracted_files.append(file_name)
+        extracted_contents.append(content)
+
+        framed_data = framed_data[8 + file_name_length + 8 + content_size:]
+
+    return extracted_files, extracted_contents
+
+def write_files(files, contents):
+    for file_name, content in zip(files, contents):
+        with open(file_name, 'wb') as f:
+            f.write(content)
+
+def handleClient(client_socket, client_address):
+    targetDir = "/home/alexblasquez5/f24-os-file-transfer-alexblasquez5"  # Update with your target directory
+    
+    print(f"Child: pid = {os.getpid()} connected to client at {client_address}")
+
+    try:
+        dataReceived = bytearray()
+
+        while True:
+            data = client_socket.recv(1024)
+            if not data:
+                break
+            dataReceived.extend(data)
+            if b'EOF' in data:
+                break
+
+        tempArchive = os.path.join(targetDir, "receivedArchive.tar")
+        with open(tempArchive, 'wb') as file:
+            file.write(dataReceived)
+        
+        os.chdir(targetDir)
+        files, contents = extract_data(dataReceived)
+        write_files(files, contents)
+        print("Files extracted, closing connection!")
+    
+    finally:
+        client_socket.close()
+
 def main():
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(('127.0.0.1', 50000))
-    sock.listen(5)  # Maximum 5 pending connections
+    listen_port = 50001
+    server_address = ('', listen_port)
 
-    print("Server is listening...")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listen_sock:
+        listen_sock.bind(server_address)
+        listen_sock.listen(1)
 
-    while True:
-        reap_zombies()
-        connection, address = sock.accept()
-        print(f"Connection from {address}")
+        print(f"Server is listening on port {listen_port}")
 
-        incoming = connection.recv(1024).decode()
-        print(f"Receiving file: {incoming}")
+        while True:
+            print("Waiting for a connection...")
+            connection, client_address = listen_sock.accept()
 
-        received_filename, received_contents = receiver(connection)
-        if received_filename and received_contents:
-            print("File has been successfully received.")
-
-        ack_message = "Acknowledged"
-        ack(connection, ack_message)
-        print("Acknowledgement sent")
-
-        connection.shutdown(socket.SHUT_WR)
-        connection.close()
+            try:
+                print(f"Connection from {client_address}")
+                handleClient(connection, client_address)
+            except Exception as e:
+                print(f"Error: {e}")
+            finally:
+                connection.close()
 
 if __name__ == "__main__":
     main()
